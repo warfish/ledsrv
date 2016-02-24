@@ -3,6 +3,12 @@
 #include <boost/noncopyable.hpp>
 #include <memory>
 
+#define LEDSRV_FIFO_NAME            "/tmp/ledsrv"
+#define LEDSRV_IN_FIFO              "/tmp/ledsrv.in.%d"
+#define LEDSRV_OUT_FIFO             "/tmp/ledsrv.out.%d"
+#define LEDSRV_STATUS_OK            "OK"
+#define LEDSRV_STATUS_FAILED        "FAILED"
+
 /**
  * \brief   Possible LED colors
  */

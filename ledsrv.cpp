@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
 
 #include <vector>
 #include <list>
@@ -18,16 +20,254 @@
 
 #include "ledsrv.h"
 
-////////////////////////////////////////////////////////////////////////////////
-
-#define LEDSRV_FIFO_NAME            "/tmp/ledsrv"
-#define LEDCLI_FIFO_NAME            "/tmp/ledcli"
-#define LEDSRV_STATUS_OK            "OK"
-#define LEDSRV_STATUS_FAILED        "FAILED"
-
 #if !defined(countof)
 #   define countof(_a) (sizeof(_a) / sizeof(_a[0]))
 #endif // countof
+
+////////////////////////////////////////////////////////////////////////////////
+
+//
+// I/O utils
+//
+
+namespace {
+
+/**
+ * \brief   RAII helper for pipe descriptor
+ */
+class Fifo : boost::noncopyable
+{
+public:
+
+    enum Type {
+        kFifoRead = 0,
+        kFifoWrite,
+    };
+
+    enum Flags {
+        kFifoDefault = 0,
+        kFifoDeleteOnClose, // Delete fifo on close
+    };
+    
+    Fifo() : m_fd(-1), m_unlink(false) {
+    }
+
+    ~Fifo() {
+        this->close();
+    }
+
+    /**
+     * \brief   Create a fifo with name and type
+     *          Will block until remote end is opened for appropriate access.
+     *
+     * \return  0 on success, negative value on error
+     */
+    int create(const std::string& name, Type type);
+
+    /**
+     * \brief   Open existing fifo
+     *
+     * \return  0 on success, negative value on error
+     */
+    int open(const std::string& name, Type type, Flags flags = kFifoDefault);
+
+    /**
+     * \brief   Read data from a fifo
+     */
+    ssize_t read(void* data, size_t bytes);
+
+    /**
+     * \brief   Write data to a fifo
+     */
+    ssize_t write(const void* data, size_t bytes);
+
+    /**
+     * \brief   Close fifo.
+     */
+    void close();
+
+    bool is_open() const {
+        return m_fd >= 0;
+    }
+
+    int fd() const {
+        return m_fd;
+    }
+
+    const std::string& name() const {
+        return m_name;
+    }
+
+private:
+
+    int m_fd;
+    std::string m_name;
+    bool m_unlink;
+};
+
+int Fifo::create(const std::string& name, Fifo::Type type)
+{
+    // Opening the same fifo?
+    if (name == m_name) {
+        return 0;
+    }
+
+    int res = 0;
+    res = ::access(name.c_str(), F_OK);
+    if (res == 0) {
+        // File exists, check if it's a pipe and remove it
+        struct stat st;
+        res = ::stat(name.c_str(), &st);
+        if (res != 0) {
+            perror("stat failed");
+            return res;
+        }
+
+        if (S_IFIFO & st.st_mode) {
+            res = ::unlink(name.c_str());
+            if (res != 0) {
+                perror("unlink failed");
+                return res;
+            }
+        }
+    }
+
+    res = ::mkfifo(name.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (res != 0) {
+        perror("mkfifo failed");
+        return res;
+    }
+
+    res = this->open(name, type, kFifoDeleteOnClose);
+    if (res != 0) {
+        ::unlink(name.c_str());
+    }
+
+    return 0;
+}
+
+int Fifo::open(const std::string& name, Type type, Flags flags /* = kDefault */)
+{
+    int fd = ::open(name.c_str(), (type == kFifoRead ? O_RDONLY : O_WRONLY));
+    if (fd < 0) {
+        return fd;
+    }
+
+    this->close();
+
+    m_fd = fd;
+    m_name = name;
+    m_unlink = (flags == kFifoDeleteOnClose);
+    return 0;
+}
+
+void Fifo::close()
+{
+    if (m_fd >= 0) {
+        ::close(m_fd);
+        if (m_unlink) {
+            ::unlink(m_name.c_str());
+        }
+
+        m_fd = -1;
+    }
+}
+
+ssize_t Fifo::read(void* data, size_t bytes)
+{
+    assert(data);
+    return ::read(m_fd, data, bytes);
+}
+
+ssize_t Fifo::write(const void* data, size_t bytes)
+{
+    assert(data);
+    return ::write(m_fd, data, bytes);
+}
+
+/**
+ * \brief   RAII helper to hold client connection fifos
+ */
+class Connection : boost::noncopyable
+{
+public:
+
+    Connection() {
+    }
+
+    ~Connection() {
+        this->close();
+    }
+
+    /**
+     * \brief   Init connection to specified client pid
+     *          Will open in and out fifos and block until remote side completes its open.
+     *
+     * \return  0 on success, negative value on error
+     */
+    int open(pid_t pid);
+
+    /**
+     * \brief   Close connection
+     */
+    void close();
+
+    Fifo& in() {
+        return m_in;
+    }
+
+    Fifo& out() {
+        return m_out;
+    }
+
+    // Shortcuts
+    ssize_t read(void* data, size_t bytes) {
+        return m_in.read(data, bytes);
+    }
+
+    ssize_t write(const void* data, size_t bytes) {
+        return m_out.write(data, bytes);
+    }
+
+private:
+
+    Fifo m_in;
+    Fifo m_out;
+};
+
+int Connection::open(pid_t pid)
+{
+    int err = 0;
+    char buf[PATH_MAX] = {0};
+    
+    snprintf(buf, sizeof(buf), LEDSRV_IN_FIFO, pid);
+    err = m_in.open(std::string(buf), Fifo::kFifoRead);
+    if (err < 0) {
+        return err;
+    }
+
+    snprintf(buf, sizeof(buf), LEDSRV_OUT_FIFO, pid);
+    err = m_out.open(std::string(buf), Fifo::kFifoWrite);
+    if (err < 0) {
+        return err;
+    }
+
+    return 0;
+}   
+
+void Connection::close()
+{
+    m_in.close();
+    m_out.close();
+}
+
+} // anonymous namespace 
+
+////////////////////////////////////////////////////////////////////////////////
+
+//
+// LED request handling
+//
 
 // Global LED state
 static LedState gLedState = {
@@ -177,7 +417,6 @@ static bool DispatchRequest(const std::string& req, std::string& respose)
     }
 
     size_t nargs = argv.size() - 1;
-    printf("%s\n", argv[0].c_str());
 
     // Find request with this command and number of args
     for (size_t i = 0; i < countof(gRequests); ++i) 
@@ -188,7 +427,7 @@ static bool DispatchRequest(const std::string& req, std::string& respose)
             LedState led = gLedState;
             bool res = r->handler(argv, respose, led);
             if (res && (led != gLedState)) {
-                gLedView->Update(led);
+                gLedView->Update(led); // Update view only when state has changed
                 gLedState = led;
             }
 
@@ -199,110 +438,90 @@ static bool DispatchRequest(const std::string& req, std::string& respose)
     return false;
 }
 
+// Read pending '\n'-separated requests from fifo
+// TODO: not sure if it is possible for fifo to accumulate several requests before we are unblocked from read.
+static bool ReadRequests(Fifo& fifo, std::vector<std::string>& req)
+{
+    // PIPE_BUF read should be atomic
+    char buf[PIPE_BUF] = {0};
+    if (fifo.read(buf, PIPE_BUF) < 0) {
+        return false;
+    }
+
+    std::string input(buf, strnlen(buf, sizeof(buf)));
+    boost::split(req, input, boost::is_any_of("\n"), boost::algorithm::token_compress_on);
+
+    // split will return an empty trailing request, remove it
+    req.pop_back();
+    return true;
+}
+
+// Process newly connected clients
+// Error are ignored but we should probably handle a lot of things, like remote fifo close, etc.
+static void ProcessClient(Connection& conn)
+{
+    std::vector<std::string> req;
+    if (!ReadRequests(conn.in(), req)) {
+        return;
+    }
+
+    for (auto i : req) {
+        std::string response;
+        if (DispatchRequest(i, response)) {
+            std::string output = LEDSRV_STATUS_OK;
+            if (response.length() > 0) {
+                output.append(" ");
+                output.append(response);
+            }
+
+            output.append("\n");
+            conn.write(output.c_str(), output.length()); 
+        } else {
+            const char* failed = LEDSRV_STATUS_FAILED "\n";
+            conn.write(failed, strlen(failed));
+        }
+    }
+}
+
+static void inthandler(int s)
+{
+    unlink(LEDSRV_FIFO_NAME);
+}
+
 int main(void)
 {
     int err = 0;
-    int fd = -1;
-    int fd_cli = -1;
-
-    BOOST_SCOPE_EXIT(&fd, &fd_cli) {
-        close(fd);
-        close(fd_cli);
-        unlink(LEDSRV_FIFO_NAME);
-    } BOOST_SCOPE_EXIT_END
-
-    err = mkfifo(LEDSRV_FIFO_NAME, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
-    if (err != 0) {
-        perror("mkfifo");
-        return EXIT_FAILURE;
-    }
-
-    err = mkfifo(LEDCLI_FIFO_NAME, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
-    if (err != 0) {
-        perror("mkfifo");
-        return EXIT_FAILURE;
-    }
-
-    fd = open(LEDSRV_FIFO_NAME, O_RDWR);
-    if (fd < 0) {
-        perror("open");
-        return EXIT_FAILURE;
-    }
-
-/*
-    fd_cli = open(LEDCLI_FIFO_NAME, O_WRONLY);
-    if (fd_cli < 0) {
-        perror("open");
-        return EXIT_FAILURE;
-    }
-*/
-    printf("%d, %d\n", fd, fd_cli);
 
     gLedView = CreateLedView();
     if (!gLedView) {
-        fprintf(stderr, "Could not create led view\n");
         return EXIT_FAILURE;
     }
 
     gLedView->Update(gLedState);
+    
+    signal(SIGINT, inthandler);
 
-    // Writes of PIPE_BUF size are guaranteed to be atomic as long as they are done in a batch
-    // PIPE_BUF itself is guaranteed to be at least 512 bytes.
+    Fifo connFifo;
+    err = connFifo.create(LEDSRV_FIFO_NAME, Fifo::kFifoRead);
+    if (err != 0) {
+        return EXIT_FAILURE;
+    }
 
-    std::string accum; // Accumulated input since last read in case command is fragmented
-    while(1) 
-    {
-        char buf[PIPE_BUF + 1] = {0}; // +1 to guarantee NULL terminator
-        ssize_t nbytes = 0;
+    // Wait for incoming PIDs on connection fifo separated by new line chars
+    std::vector<std::string> req;
+    while (ReadRequests(connFifo, req)) {
+        for (auto i : req) {
+            int pid = std::stoi(i);
 
-        nbytes = read(fd, buf, PIPE_BUF);
-        if (nbytes < 0) {
-            perror("read");
-            return EXIT_FAILURE;
-        }
-
-        printf("Read: %s", buf);
-
-        // Construct new buffer and scan for requests
-        std::string str = accum + buf;
-        size_t pos = 0;
-        while(1) {
-            size_t end = str.find('\n', pos);
-            if (end == std::string::npos) {
-                // We've reached the end of the buffer without seeing full request
-                // Store remaining data in accumulator buffer and continue
-                accum = str.substr(pos);
-                break;
-            }
-
-            std::string response;
-            if (DispatchRequest(str.substr(pos, end - pos), response)) {
-                // Try and do a single write
-                std::string output = LEDSRV_STATUS_OK;
-                if (response.length() > 0) {
-                    output.append(" ");
-                    output.append(response);
-                }
-                output.append("\n");
-
-                printf("%s", output.c_str());
-                nbytes = write(fd, output.c_str(), output.length()); 
-            } else {
-                const char* failed = LEDSRV_STATUS_FAILED "\n";
-                printf("%s", failed);
-                nbytes = write(fd, failed, strlen(failed));
-            }
-
-            if (nbytes < 0) {
-                perror("write");
+            Connection conn;
+            err = conn.open(pid);
+            if (err) {
                 return EXIT_FAILURE;
             }
 
-            fsync(fd_cli);
-            pos = end + 1;
+            ProcessClient(conn);
         }
     }
 
-    return err;
+    return EXIT_SUCCESS;
 }
-

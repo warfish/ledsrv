@@ -1,6 +1,8 @@
 #!/bin/bash
 
 LEDSRV_FIFO_NAME=/tmp/ledsrv
+LEDSRV_IN_FIFO=/tmp/ledsrv.in.$BASHPID
+LEDSRV_OUT_FIFO=/tmp/ledsrv.out.$BASHPID
 
 if [[ $# < 1 ]]; then
     echo "$0:";
@@ -10,15 +12,21 @@ if [[ $# < 1 ]]; then
     exit 0;
 fi
 
-reply='';
+# Create our fifos for server and send connection request
+mkfifo $LEDSRV_IN_FIFO
+mkfifo $LEDSRV_OUT_FIFO
+echo $BASHPID > $LEDSRV_FIFO_NAME
 
 case $1 in
-"get-led-state") 
-    echo get-led-state > $LEDSRV_FIFO_NAME
-    reply = `cat $LEDSRV_FIFO_NAME`
+"get-led-state"|"get-led-color"|"get-led-rate") 
+    echo $1 > $LEDSRV_IN_FIFO
 ;;
+
+"set-led-state"|"set-led-color"|"set-led-rate") 
+    echo $1 $2 > $LEDSRV_IN_FIFO
+;;
+
 esac
 
-echo $reply
-
-
+cat $LEDSRV_OUT_FIFO
+rm $LEDSRV_IN_FIFO $LEDSRV_OUT_FIFO
